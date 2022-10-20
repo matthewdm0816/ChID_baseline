@@ -46,7 +46,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 
 
-logger = init_logger(logging.getLogger(__name__))
+logger = init_logger_nonddp(logging.getLogger(__name__))
 
 
 @dataclass
