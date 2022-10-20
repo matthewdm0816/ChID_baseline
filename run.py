@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from model import BertForChID
+from utils import *
 
 import transformers
 from transformers import (
@@ -45,7 +46,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 
 
-logger = logging.getLogger(__name__)
+logger = init_logger(logging.getLogger(__name__))
 
 
 @dataclass
