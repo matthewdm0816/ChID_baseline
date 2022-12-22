@@ -43,7 +43,7 @@ from transformers import (
 )
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_utils import get_last_checkpoint
-
+import json
 
 
 logger = init_logger_nonddp(logging.getLogger(__name__))
@@ -295,8 +295,20 @@ def main():
         )
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
+    print(raw_datasets.num_rows)
 
-    # Load pretrained model and tokenizer
+    # --- Load idiom vocab
+    idiom_vocab = json.load(open("idiom_vocab.json", "r"))
+    num_idioms = len(idiom_vocab)
+    v2i = {v: i for i, v in enumerate(idiom_vocab)}
+
+    # --- Load idiom explanation
+    idiom_expl = json.load(open("idiom.json", "r"))
+    idiom_expl = {
+        item["word"]: item["explanation"] for item in idiom_expl
+    }
+
+    # Load pretrained model and tokenizer\
 
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
@@ -306,7 +318,41 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        
     )
+
+    # === additional configs
+    # additional_config = {
+    #     "num_idioms": num_idioms,
+    #     "use_mlm": False,
+    #     "use_fused_cls": True,
+    # }
+    # additional_config = {
+    #     "num_idioms": num_idioms,
+    #     "use_mlm": True,
+    #     "use_fused_cls": False,
+    #     "use_c&e": True,
+    #     "use_c": False,
+    #     "use_prefixlm": True,
+    #     "prefix_len": 8,
+    #     "frozen_backbone": False
+    # }
+
+    additional_config = {
+        "num_idioms": num_idioms,
+        "use_mlm": False,
+        "use_fused_cls": True,
+        "use_c&e": False,
+        "use_c": False,
+        "use_prefixlm": False,
+        "prefix_len": 8,
+        "frozen_backbone": False,
+    }
+    setattr(training_args, "frozen_backbone", additional_config["frozen_backbone"])
+    print(additional_config)
+    for k, v in additional_config.items():
+        setattr(config, k, v)
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -323,7 +369,11 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    label_column_name = "labels"
+    if config.use_mlm:
+        label_column_name = "labels"
+    else:
+        label_column_name = "idiom_labels"
+        
     idiom_tag = '#idiom#'
 
     if data_args.max_seq_length is None:
@@ -342,13 +392,15 @@ def main():
             )
         max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
+    
+
     # Preprocessing the datasets.
 
     # We only consider one idiom per instance in the dataset, a sentence containing multiple idioms will be split into multiple instances.
     # The idiom tag of each instance will be replaced with 4 [MASK] tokens.
     def preprocess_function_resize(examples):
         return_dic = {}
-        return_dic_keys = ['candidates', 'content', 'labels']
+        return_dic_keys = ['candidates', 'content', 'labels', 'idiom_labels', 'idiom_candidates']
         for k in return_dic_keys:
             return_dic[k] = []
 
@@ -357,17 +409,27 @@ def main():
             text = examples['content'][i]
             for j in range(examples['realCount'][i]):
                 return_dic['candidates'].append(examples['candidates'][i][j])
+                return_dic['idiom_candidates'].append([v2i[c] for c in examples['candidates'][i][j]])
                 idx = text.find(idiom_tag, idx+1)
                 return_dic['content'].append(text[:idx] + tokenizer.mask_token*4 + text[idx+len(idiom_tag):])
                 for k, candidate in enumerate(examples['candidates'][i][j]):
                     if candidate == examples['groundTruth'][i][j]:
                         return_dic['labels'].append(k)
+                        return_dic['idiom_labels'].append(v2i[candidate])
                         break
         return return_dic
 
     # tokenize all instances
     def preprocess_function_tokenize(examples):
         first_sentences = examples['content']
+        # add explanations
+        if additional_config["use_c&e"] or additional_config["use_c"]:
+            for i, sentence in enumerate(first_sentences):
+                if additional_config["use_c&e"]:
+                    explanation = "".join([f"候选词为{c}的含义是{idiom_expl[c]}。" for c in examples['candidates'][i] if c in idiom_expl])
+                else:
+                    explanation = "候选词为" + "".join([f" {c}" for c in examples['candidates'][i] if c in idiom_expl]) + "。"
+                first_sentences[i] += explanation
         labels = examples[label_column_name]
         # truncate the first sentences.
         for i, sentence in enumerate(first_sentences):
@@ -385,10 +447,13 @@ def main():
             truncation=True,
         )
         tokenized_examples["labels"] = labels
+        tokenized_examples["idiom_labels"] = examples["idiom_labels"]
         tokenized_candidates = [[tokenizer.convert_tokens_to_ids(list(candidate)) for candidate in candidates]for candidates in examples['candidates']]
         tokenized_examples["candidates"] = tokenized_candidates
+        # tokenized_examples[""]
         return tokenized_examples
 
+    
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -456,9 +521,6 @@ def main():
         if data_args.pad_to_max_length
         else DataCollatorForChID(tokenizer=tokenizer, pad_to_multiple_of=8 if training_args.fp16 else None)
     )
-    # data_collator = default_data_collator
-
-
 
     # Metric
     def compute_metrics(eval_predictions):
@@ -467,7 +529,7 @@ def main():
         return {"accuracy": (preds == label_ids).astype(np.float32).mean().item()}
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = ChIDTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
